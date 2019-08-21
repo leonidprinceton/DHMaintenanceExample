@@ -77,7 +77,8 @@ R = numpy.zeros((SL//BS,BS//SS,BS//SS))
 R_indices = numpy.where([numpy.eye(BS//SS) for _ in range(len(H))])
 
 #The drift covariance matrix for each pixel (or block of pixels). Needs to be estimated if the model is not perfectly known.
-Q = numpy.array([tm.wfe_influence_matrix[i*BS:(i+1)*BS].dot(tm.drift_covariance).dot(tm.wfe_influence_matrix[i*BS:(i+1)*BS].T)*tm.intensity_to_photons for i in range(SL//BS)])
+block_influence_matrix = tm.wfe_influence_matrix.reshape((-1,BS,len(tm.drift_covariance)))
+Q = numpy.matmul(block_influence_matrix.dot(tm.drift_covariance), block_influence_matrix.transpose(0,2,1))*tm.intensity_to_photons
 
 #For simplicity, start with a perfect estimate (presumably obtained during them dark hole digging stage)
 x_hat = tm.E_dark_hole*tm.intensity_to_photons**0.5 #Rhe estimate of the electric field (x_hat) is scaled for convenience
