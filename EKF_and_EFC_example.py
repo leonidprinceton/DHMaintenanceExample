@@ -20,34 +20,93 @@ from matplotlib import animation
 ##
 DRIFT_MAGNITUDE = 3.2e-11 #(sigma_d)
 DITHER_MAGNITUDE = 5e-3 #(sigma_u) #Original value: 5e-3 with IFS on
-USE_IFS = False
+USE_IFS = False#True#False
 N_WAVELENGTHS = 5
 N_PIXELS = 2608
+
+def fisher_information(photon_flux, sampling_time, wfe_modes_CL, G_i, D_i, static_e_field):
+    numerator = 4*photon_flux*sampling_time #photon flux already includes sampling time
+    denominator = numpy.linalg.norm(G_i@wfe_modes_CL + static_e_field)**2 + D_i/photon_flux
+
+    factor = G_i.T@(numpy.dot(G_i,wfe_modes_CL) + static_e_field)
+    factor_T = (numpy.dot(G_i, wfe_modes_CL) + static_e_field).reshape(1, 10)@G_i
+    return numerator/denominator*factor.reshape(10,1)@factor_T.reshape(1,10)
+
+def pk_converged(P_ks, Pk, eps=1e-30):
+    P_avg = numpy.mean(P_ks, axis=0)
+    return numpy.all(numpy.abs(P_avg - Pk) < eps)
+
+
+def find_bound_random_sampling(Q, n_wfe_modes, photon_flux, sampling_time, G_i, D_i, static_e_field):
+    #Dither should be slightly above the theoretical bound (but within a factor of 4)
+    #Covariance should be for a single pixel (2x2) -- so multiply modes (2 x 21) by Q (21 x 21) by modes (21 x 2) to get 2x2
+    #Initialize Pk
+    #Get single pixel covariance
+    G_i = G_i[0, 0:10]
+    static_e_field = static_e_field[0]#[0:2]
+    Q = G_i@Q@G_i.T #Reduce from all modes to 2x2 matrix (convert from modes to real + imaginary parts of E-field)
+
+    Pk = numpy.zeros(Q.shape)
+    P_ks = []
+    #While not converged:
+    while True:
+        #Sample wfe_modes_CL -- this won't work with one pixel (not all modes are observable)
+        wfe_modes_CL = numpy.random.multivariate_normal(numpy.zeros(10), Pk + Q).T
+        #Compute Fisher information
+        F = fisher_information(photon_flux, sampling_time, wfe_modes_CL, numpy.eye(10), D_i, static_e_field)
+        #Advance Pk
+        P_ks.append(Pk)
+        Pk = numpy.linalg.inv(F + numpy.linalg.inv(Pk + Q))
+        #Pk = numpy.linalg.inv(F)
+        #Pk = numpy.linalg.inv(F)# + numpy.linalg.inv(Pk + Q))
+        if pk_converged(P_ks, Pk):
+            P_ks.append(Pk)
+            return P_ks
+        #print(Pk[0,0] - P_ks[-1][0,0])
+        print(Pk[0,0])
 
 class LinearTelescopeModel:
     def __init__(self):
         self.dm_influence_matrix = numpy.load("dm_influence_matrix_x_1890000.npy")/1890000.0 #DM Jacobian stored as int8 to save space and scaled back to its original range
         self.wfe_influence_matrix = numpy.load("wfe_influence_matrix.npy") #This matrix is for simulating speckles drift
         self.E_dark_hole = numpy.load("E_dark_hole.npy") #Electric field after digging the dark hole
-        self.dark_current = 0.25
-        self.intensity_to_photons = 5e9 #A scaling factor to convert from electric field to average number of photons per frame
+        self.dark_current = 0.25 #Di*ts (unitless)
+        self.intensity_to_photons = 5e9 #N_s*ts (unitless) -- A scaling factor to convert from electric field to average number of photons per frame
         self.cmd = numpy.zeros(self.dm_influence_matrix.shape[1]) #DM command (0 at dark hole setting)
         self.wfe_coeff = numpy.zeros(self.wfe_influence_matrix.shape[1]) #The state of the wavefront errors as they drift
         self.last_image = None
 
         max_zernikes_order = 6
         drift_std = [DRIFT_MAGNITUDE/(p+1)**2 for p in range(max_zernikes_order) for _ in range(p+1)] #Standard deviation of incrments of Zernike coefficient should decrease with polynomial order
-        self.drift_covariance = numpy.diag(numpy.square(drift_std))
+        self.drift_covariance = numpy.diag(numpy.square(drift_std)) #Q
 
     def advance(self, dm_command):
         self.cmd = dm_command
         self.wfe_coeff += numpy.random.multivariate_normal(numpy.zeros(self.wfe_coeff.shape), self.drift_covariance)#WFE random walk
         self.last_image = None
 
+    def get_E_static(self):
+        #Reshape E_dark_hole to 2608 x 10
+        E_dark_hole_re = self.E_dark_hole[::2]
+        E_dark_hole_im = self.E_dark_hole[1::2]
+        if not USE_IFS:
+            E_static = numpy.zeros((N_PIXELS, N_WAVELENGTHS*2))
+            for i in range(N_WAVELENGTHS):
+                E_static[:, i*2] = E_dark_hole_re[i*N_PIXELS:(i+1)*N_PIXELS]
+                E_static[:, i*2+1] = E_dark_hole_im[i*N_PIXELS:(i+1)*N_PIXELS]
+        else:
+            E_static = numpy.zeros((N_PIXELS*N_WAVELENGTHS, 2))
+            E_static[:, 0] = E_dark_hole_re
+            E_static[:, 1] = E_dark_hole_im
+        return E_static
+
     def get_E_open_loop(self):
+        #E_0, i = E_dark_hole
         return self.E_dark_hole + self.wfe_influence_matrix.dot(self.wfe_coeff) #Elecrtic field if the DM were fixed
 
     def get_E_closed_loop(self):
+        #dm influence = G_i
+        #cmd = e_CL
         return self.get_E_open_loop() + self.dm_influence_matrix.dot(self.cmd)
 
     def get_I_open_loop(self):
@@ -91,38 +150,49 @@ class LinearTelescopeModel:
         return self.last_image
 
 tm = LinearTelescopeModel()
-print("Computing EFC gain")
-EFC_gain = numpy.linalg.inv(tm.dm_influence_matrix.T.dot(tm.dm_influence_matrix) + numpy.eye(tm.dm_influence_matrix.shape[1])*1e-8).dot(tm.dm_influence_matrix.T)
+#print("Computing EFC gain")
+#EFC_gain = numpy.linalg.inv(tm.dm_influence_matrix.T.dot(tm.dm_influence_matrix) + numpy.eye(tm.dm_influence_matrix.shape[1])*1e-8).dot(tm.dm_influence_matrix.T) #G_i
 
 SS = 2#Pixel state size. Two for real and imaginary parts of the electric field. If incoherent intensity is not ignored, SS should be 3 and the EKF modified accordingly.
 BS = SS*1#EKF block size - number of pixels per EKF (currently 1). Computation time grows as the cube of BS.
-SL = EFC_gain.shape[1]#Total length of the sate vector (all pixels).
+#SL = EFC_gain.shape[1]#Total length of the sate vector (all pixels).
 
 #3D matrices that include all the 2D EKF matrices for all pixels at once
+"""
 if USE_IFS:
     H = numpy.zeros((SL//BS,BS//SS,BS))
     H_indices = numpy.where([numpy.kron(numpy.eye(BS//SS), numpy.ones(SS)) for _ in range(len(H))])
     R = numpy.zeros((SL//BS,BS//SS,BS//SS))
     R_indices = numpy.where([numpy.eye(BS//SS) for _ in range(len(H))])
-
-else:
+"""
     #H = numpy.zeros((N_PIXELS, N_PIXELS*N_WAVELENGTHS*2))
     #R = numpy.zeros((N_PIXELS, N_PIXELS))
-    H = numpy.zeros((N_PIXELS, 1, N_WAVELENGTHS*2))
-    R = numpy.zeros((N_PIXELS, 1, 1))
+H = numpy.zeros((N_PIXELS, 1, N_WAVELENGTHS*2))
+R = numpy.zeros((N_PIXELS, 1, 1))
 
 #The drift covariance matrix for each pixel (or block of pixels). Needs to be estimated if the model is not perfectly known.
 block_influence_matrix = tm.wfe_influence_matrix.reshape((-1,BS,len(tm.drift_covariance)))
 Q = numpy.matmul(block_influence_matrix.dot(tm.drift_covariance), block_influence_matrix.transpose(0,2,1))*tm.intensity_to_photons
+static_e_field = tm.get_E_static()#E_dark_hole
+G_i = tm.wfe_influence_matrix
+D_i = tm.dark_current
+photon_flux = tm.intensity_to_photons
+sampling_time = 1#512 #What is the sampling time?
+n_wfe_modes = tm.wfe_influence_matrix.shape[1]
 
 if not USE_IFS:
     new_Q = numpy.zeros((N_PIXELS, N_WAVELENGTHS*2, N_WAVELENGTHS*2))
+    new_block_influence_matrix = numpy.zeros((N_PIXELS, N_WAVELENGTHS*2, n_wfe_modes))
+    new_wfe_influence_matrix = numpy.zeros((N_PIXELS, N_WAVELENGTHS*2, n_wfe_modes))
     for i in range(N_PIXELS):
         for wv in range(N_WAVELENGTHS):
             new_Q[i, wv*2, wv*2] = Q[i+wv*N_PIXELS, 0, 0]
             new_Q[i, wv*2+1, wv*2+1] = Q[i+wv*N_PIXELS, 1, 1]
             new_Q[i, wv*2, wv*2+1] = Q[i+wv*N_PIXELS, 0, 1]
             new_Q[i, wv*2+1, wv*2] = Q[i+wv*N_PIXELS, 1, 0]
+
+            new_block_influence_matrix[i, wv*2, :] = block_influence_matrix[i+wv*N_PIXELS, 0, :]
+            new_block_influence_matrix[i, wv*2+1, :] = block_influence_matrix[i+wv*N_PIXELS, 1, :]
     """
     new_Q = numpy.zeros((N_PIXELS*N_WAVELENGTHS*2, N_PIXELS*N_WAVELENGTHS*2))
     for i in range(N_PIXELS*N_WAVELENGTHS):
@@ -132,10 +202,14 @@ if not USE_IFS:
         new_Q[i*2, i*2+1] = Q[i, 0, 1]
     """
     Q = new_Q
+    block_influence_matrix = new_block_influence_matrix
+G_i = block_influence_matrix
+Q_px = tm.drift_covariance #block_influence_matrix[0, :, :].T@new_Q[0, :, :]@block_influence_matrix[0, :, :]
+P_ks = find_bound_random_sampling(Q_px, n_wfe_modes, photon_flux, sampling_time, G_i, D_i, static_e_field)
 
 #For simplicity, start with a perfect estimate (presumably obtained during them dark hole digging stage)
 x_hat = tm.E_dark_hole*tm.intensity_to_photons**0.5 #Rhe estimate of the electric field (x_hat) is scaled for convenience
-P = Q*0.0
+P = Q*0.0 #Pk
 
 u = numpy.zeros(EFC_gain.shape[0])
 EKF_errs = []
